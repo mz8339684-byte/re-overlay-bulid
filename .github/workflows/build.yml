@@ -31,8 +31,17 @@ jobs:
       - name: Apply the overlay patches
         shell: bash
         run: |
-          git -C REPlus apply --ignore-whitespace --whitespace=nowarn ../patches/replus.patch
-          git -C simplecamera apply --ignore-whitespace --whitespace=nowarn ../patches/addon.patch
+          echo "Files in this repository:"
+          find . -path ./REPlus -prune -o -path ./simplecamera -prune -o -path ./.git -prune -o -type f -print
+          R=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/REPlus" -prune -o -path "$GITHUB_WORKSPACE/simplecamera" -prune -o -type f -name 'replus*.patch' -print | head -1)
+          A=$(find "$GITHUB_WORKSPACE" -path "$GITHUB_WORKSPACE/REPlus" -prune -o -path "$GITHUB_WORKSPACE/simplecamera" -prune -o -type f -name 'addon*.patch' -print | head -1)
+          if [ -z "$R" ] || [ -z "$A" ]; then
+            echo "::error::Could not find replus.patch and addon.patch in the repository. Upload both files (HOW-TO step 3)."
+            exit 1
+          fi
+          echo "Using $R and $A"
+          git -C REPlus apply --ignore-whitespace --whitespace=nowarn "$R"
+          git -C simplecamera apply --ignore-whitespace --whitespace=nowarn "$A"
 
       - name: Build RockstarEditorPlus.asi
         run: |
