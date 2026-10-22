@@ -1,0 +1,418 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 96355a3..ee1ce0a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -320,7 +320,7 @@ if(ENABLE_LOGS)
+ endif()
+ 
+ target_link_directories(RockstarEditorPlus PUBLIC "${CMAKE_BINARY_DIR}/LIB")
+-target_link_libraries(RockstarEditorPlus version.lib shell32.lib debug minhook.x64d.lib optimized minhook.x64.lib)
++target_link_libraries(RockstarEditorPlus version.lib shell32.lib gdiplus.lib debug minhook.x64d.lib optimized minhook.x64.lib)
+ 
+ # =============================================================================
+ #  Preset Maker - a small GUI for authoring encoder presets
+diff --git a/src/capture/overlay.cpp b/src/capture/overlay.cpp
+new file mode 100644
+index 0000000..c6a2215
+--- /dev/null
++++ b/src/capture/overlay.cpp
+@@ -0,0 +1,247 @@
++// This file is part of RockstarEditorPlus.
++// SPDX-License-Identifier: GPL-3.0-only
++
++#include <Windows.h>
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <fstream>
++#include <memory>
++#include <string>
++#include <vector>
++
++// GDI+ needs min/max; the project builds with NOMINMAX.
++namespace Gdiplus { using std::min; using std::max; }
++#include <objidl.h>
++#include <gdiplus.h>
++#pragma comment(lib, "gdiplus.lib")
++
++#include "capture/overlay.h"
++#include "utils/log.h"
++#include "utils/paths.h"
++
++namespace overlay
++{
++	namespace
++	{
++		struct Entry
++		{
++			bool  picture = false;
++			float x = 0.5f, y = 0.5f;   // centre, fraction of the frame
++			float size = 0.2f;          // picture: width / frame width
++			                            // text:    em height / frame height
++			float opacity = 1.0f;
++			int   r = 255, g = 255, b = 255;
++			std::string content;        // text, or picture file name
++			std::unique_ptr<Gdiplus::Bitmap> bmp;   // pictures, loaded once
++		};
++
++		std::vector<Entry> s_entries;
++		ULONG_PTR s_token = 0;
++		bool s_gdi = false;
++
++		std::wstring widen(const std::string& s)
++		{
++			if (s.empty()) return L"";
++			int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
++			std::wstring w((size_t)std::max(n, 1) - 1, L'\0');
++			MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, w.data(), n);
++			return w;
++		}
++
++		std::string unesc(const std::string& s)
++		{
++			std::string o;
++			for (size_t i = 0; i < s.size(); ++i)
++			{
++				if (s[i] == '\\' && i + 1 < s.size())
++				{
++					char n = s[++i];
++					o += (n == 't') ? '\t' : (n == 'n') ? '\n' : n;
++				}
++				else o += s[i];
++			}
++			return o;
++		}
++
++		bool encoderClsid(const wchar_t* mime, CLSID* out)
++		{
++			UINT n = 0, bytes = 0;
++			Gdiplus::GetImageEncodersSize(&n, &bytes);
++			if (!bytes) return false;
++			std::vector<char> buf(bytes);
++			auto* info = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buf.data());
++			Gdiplus::GetImageEncoders(n, bytes, info);
++			for (UINT i = 0; i < n; ++i)
++				if (wcscmp(info[i].MimeType, mime) == 0) { *out = info[i].Clsid; return true; }
++			return false;
++		}
++
++		std::string dir() { return paths::sub("overlay"); }
++	}
++
++	void publishFolder()
++	{
++		const std::string d = dir();                 // creates the folder
++		CreateDirectoryA((d + "images").c_str(), nullptr);
++		SetEnvironmentVariableA("REP_OVERLAY_DIR", d.c_str());
++		logger::write("info", "overlay: folder %s", d.c_str());
++	}
++
++	bool begin()
++	{
++		end();
++
++		std::ifstream f(dir() + "overlay.txt");
++		if (!f) return false;
++
++		bool enabled = true;
++		std::string line;
++		while (std::getline(f, line))
++		{
++			if (line.empty()) continue;
++			// type, visible, x, y, size, opacity, r, g, b, then content (the
++			// rest of the line, so text may contain anything but a newline).
++			std::vector<std::string> p;
++			size_t pos = 0;
++			for (int i = 0; i < 9; ++i)
++			{
++				size_t t = line.find('\t', pos);
++				if (t == std::string::npos) { p.push_back(line.substr(pos)); pos = line.size(); break; }
++				p.push_back(line.substr(pos, t - pos));
++				pos = t + 1;
++			}
++			if (p.size() >= 2 && p[0] == "#v1") { enabled = p[1] == "1"; continue; }
++			if (p.size() < 9) continue;
++			if (p[1] != "1") continue;   // hidden entries cost nothing per frame
++
++			Entry e;
++			e.picture = p[0] == "P";
++			e.x = (float)atof(p[2].c_str());
++			e.y = (float)atof(p[3].c_str());
++			e.size = (float)atof(p[4].c_str());
++			e.opacity = std::clamp((float)atof(p[5].c_str()), 0.0f, 1.0f);
++			e.r = atoi(p[6].c_str()); e.g = atoi(p[7].c_str()); e.b = atoi(p[8].c_str());
++			e.content = unesc(pos < line.size() ? line.substr(pos) : "");
++			if (e.content.empty() || e.size <= 0.0f) continue;
++			s_entries.push_back(std::move(e));
++		}
++		if (!enabled) s_entries.clear();
++		if (s_entries.empty()) return false;
++
++		Gdiplus::GdiplusStartupInput in;
++		if (Gdiplus::GdiplusStartup(&s_token, &in, nullptr) != Gdiplus::Ok)
++		{
++			logger::write("error", "overlay: GDI+ failed to start - overlay skipped");
++			s_entries.clear();
++			return false;
++		}
++		s_gdi = true;
++
++		// Load every picture once; per-frame work is then just a draw.
++		for (auto& e : s_entries)
++		{
++			if (!e.picture) continue;
++			auto bmp = std::make_unique<Gdiplus::Bitmap>(widen(dir() + "images\\" + e.content).c_str());
++			if (bmp->GetLastStatus() != Gdiplus::Ok || bmp->GetWidth() == 0)
++			{
++				logger::write("warn", "overlay: cannot load picture '%s'", e.content.c_str());
++				continue;
++			}
++			e.bmp = std::move(bmp);
++		}
++		logger::write("info", "overlay: %d entries will be burned into the frames", (int)s_entries.size());
++		return true;
++	}
++
++	void apply(const char* framePath, bool jpeg, int quality)
++	{
++		if (!s_gdi || s_entries.empty() || !framePath) return;
++
++		const std::wstring src = widen(framePath);
++		const std::wstring tmp = src + L".ovl";
++		CLSID clsid{};
++		if (!encoderClsid(jpeg ? L"image/jpeg" : L"image/png", &clsid)) return;
++
++		bool saved = false;
++		{
++			// Bitmap(file) locks the file until it is destroyed, so everything
++			// that touches it lives in this scope, before the swap below.
++			Gdiplus::Bitmap frame(src.c_str());
++			if (frame.GetLastStatus() != Gdiplus::Ok) return;
++			const int W = (int)frame.GetWidth(), H = (int)frame.GetHeight();
++
++			// Draw on a 32bpp ARGB copy: PNGs from the add-on may be indexed or
++			// 24bpp, which GDI+ cannot create a Graphics for.
++			Gdiplus::Bitmap canvas(W, H, PixelFormat32bppARGB);
++			{
++				Gdiplus::Graphics g(&canvas);
++				g.DrawImage(&frame, 0, 0, W, H);
++				g.SetSmoothingMode(Gdiplus::SmoothingModeHighQuality);
++				g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
++				g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHalf);
++				g.SetTextRenderingHint(Gdiplus::TextRenderingHintAntiAliasGridFit);
++
++				for (auto& e : s_entries)
++				{
++					const float cx = e.x * W, cy = e.y * H;
++					if (e.picture)
++					{
++						if (!e.bmp) continue;
++						const float w = e.size * W;
++						const float h = w * (float)e.bmp->GetHeight() / (float)e.bmp->GetWidth();
++						Gdiplus::ColorMatrix cm = { 1,0,0,0,0,  0,1,0,0,0,  0,0,1,0,0,
++						                            0,0,0,e.opacity,0,  0,0,0,0,1 };
++						Gdiplus::ImageAttributes ia;
++						ia.SetColorMatrix(&cm);
++						Gdiplus::RectF dst(cx - w * 0.5f, cy - h * 0.5f, w, h);
++						g.DrawImage(e.bmp.get(), dst, 0, 0, (Gdiplus::REAL)e.bmp->GetWidth(),
++						            (Gdiplus::REAL)e.bmp->GetHeight(), Gdiplus::UnitPixel, &ia);
++					}
++					else
++					{
++						const float em = std::max(4.0f, e.size * H);
++						Gdiplus::FontFamily fam(L"Segoe UI");
++						Gdiplus::Font font(&fam, em, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
++						Gdiplus::StringFormat fmt;
++						fmt.SetAlignment(Gdiplus::StringAlignmentCenter);
++						fmt.SetLineAlignment(Gdiplus::StringAlignmentCenter);
++						const std::wstring w = widen(e.content);
++						const int a = (int)(255 * e.opacity);
++						const float sh = std::max(1.0f, em * 0.045f);
++						Gdiplus::SolidBrush shadow(Gdiplus::Color((BYTE)(a * 0.8f), 0, 0, 0));
++						Gdiplus::SolidBrush ink(Gdiplus::Color((BYTE)a, (BYTE)e.r, (BYTE)e.g, (BYTE)e.b));
++						g.DrawString(w.c_str(), -1, &font, Gdiplus::PointF(cx + sh, cy + sh), &fmt, &shadow);
++						g.DrawString(w.c_str(), -1, &font, Gdiplus::PointF(cx, cy), &fmt, &ink);
++					}
++				}
++			}
++
++			Gdiplus::EncoderParameters ep{};
++			ULONG q = (ULONG)std::clamp(quality, 1, 100);
++			if (jpeg)
++			{
++				ep.Count = 1;
++				ep.Parameter[0].Guid = Gdiplus::EncoderQuality;
++				ep.Parameter[0].Type = Gdiplus::EncoderParameterValueTypeLong;
++				ep.Parameter[0].NumberOfValues = 1;
++				ep.Parameter[0].Value = &q;
++			}
++			saved = canvas.Save(tmp.c_str(), &clsid, jpeg ? &ep : nullptr) == Gdiplus::Ok;
++		}
++
++		if (saved) saved = MoveFileExW(tmp.c_str(), src.c_str(), MOVEFILE_REPLACE_EXISTING) != 0;
++		if (!saved)
++		{
++			DeleteFileW(tmp.c_str());
++			static bool warned = false;
++			if (!warned) { warned = true; logger::write("warn", "overlay: could not write onto %s - frames are unmarked", framePath); }
++		}
++	}
++
++	void end()
++	{
++		s_entries.clear();   // destroys the Bitmaps - must happen before shutdown
++		if (s_gdi) { Gdiplus::GdiplusShutdown(s_token); s_gdi = false; }
++	}
++}
+diff --git a/src/capture/overlay.h b/src/capture/overlay.h
+new file mode 100644
+index 0000000..b8e3e06
+--- /dev/null
++++ b/src/capture/overlay.h
+@@ -0,0 +1,51 @@
++// This file is part of RockstarEditorPlus.
++// SPDX-License-Identifier: GPL-3.0-only
++
++#pragma once
++
++// =============================================================================
++//  Video overlay - your own text and pictures, burned into the rendered frames
++// =============================================================================
++//  The overlay is authored in the ReShade add-on's "Video overlay" panel (it
++//  can take typed text and list picture files, which the editor's own menu
++//  cannot). The panel writes
++//
++//      <base>\overlay\overlay.txt        the entries
++//      <base>\overlay\images\            the pictures
++//
++//  and this module reads that at the start of a render and composites it onto
++//  every finished frame, in place, just before the frame is handed to ffmpeg
++//  (or left on disk, for an image-sequence render).
++//
++//  WHY THE FILE AND NOT THE SCREEN. The frames come from the add-on's capture of
++//  the back buffer. Anything drawn in-engine would depend on the editor's HUD
++//  state and on being drawn before the capture; compositing the saved PNG is
++//  independent of both, identical for every frame, and works on Legacy and
++//  Enhanced alike. It uses GDI+, which ships with Windows - no new dependency.
++//
++//  Coordinates are fractions of the frame, so one overlay is right at 1080p,
++//  1440p or 4K.
++// =============================================================================
++namespace overlay
++{
++	// Create <base>\overlay\ and tell the add-on where it is, through the
++	// REP_OVERLAY_DIR environment variable (same process, so no protocol or
++	// file needed). Call once at startup, from the init shared by the normal and
++	// FiveM start paths.
++	//
++	// Needed because the two halves otherwise guess differently: this side
++	// keeps its files beside the .asi (FiveM: in plugins\), while the add-on
++	// only knows the host exe's folder - which under FiveM is a cache dir.
++	void publishFolder();
++
++	// Read overlay.txt. Call once when a render starts. Returns true if there is
++	// anything visible to draw (so the caller can log it).
++	bool begin();
++
++	// Composite onto one finished frame, in place. No-op when begin() found
++	// nothing. `jpeg`/`quality` must match how the add-on wrote the file.
++	void apply(const char* framePath, bool jpeg, int quality);
++
++	// Release the pictures and GDI+. Safe to call without begin().
++	void end();
++}
+diff --git a/src/capture/render.cpp b/src/capture/render.cpp
+index 5fc031d..ddd49b9 100644
+--- a/src/capture/render.cpp
++++ b/src/capture/render.cpp
+@@ -11,6 +11,7 @@
+ #include "game/worldprobe.h"
+ #include "capture/exporthook.h"
+ #include "capture/videoout.h"
++#include "capture/overlay.h"
+ #include "capture/audioout.h"
+ #include "capture/dofsession.h"
+ #include "game/signatures.h"
+@@ -934,6 +935,18 @@ namespace render
+ 				s_cfg.jpeg ? "jpg" : "png");
+ 		}
+ 
++		// The current output frame is final on disk: burn the user's overlay
++		// into it (no-op without one), then hand it to the encoder. The overlay
++		// goes first so ffmpeg - and an image-sequence render - get the marked
++		// frame, and runs whether or not a video is being made.
++		void finalizeFrame()
++		{
++			char done[MAX_PATH];
++			buildPath(done, sizeof(done));
++			overlay::apply(done, s_cfg.jpeg, s_cfg.quality);
++			if (videoout::active()) videoout::pushFrame(done);
++		}
++
+ 		// Drop an ffmpeg cheat-sheet next to the frames.
+ 		//
+ 		// The intended workflow is to render with no in-engine blur at a
+@@ -1134,6 +1147,7 @@ namespace render
+ 			// Called unconditionally - end() is a no-op when no video was
+ 			// started, and an aborted render still deserves its partial video.
+ 			videoout::end(complete);
++			overlay::end();
+ 
+ 			// The assemble helper is for the frames-only workflow. With a video
+ 			// already written and the frames consumed, it would describe files
+@@ -1623,6 +1637,7 @@ namespace render
+ 			// Started here, once s_folder and the settings are final, so the
+ 			// encoder's frame rate is the one actually being rendered at.
+ 			videoout::begin(s_folder, s_cfg.fps);
++			overlay::begin();
+ 
+ 			s_startTick  = GetTickCount();
+ 			s_lastReport = s_startTick;
+@@ -2717,12 +2732,7 @@ namespace render
+ 				}
+ 				if (s_fxStep) game::fixedTimeHold(false);
+ 
+-				if (videoout::active())
+-				{
+-					char done[MAX_PATH];
+-					buildPath(done, sizeof(done));
+-					videoout::pushFrame(done);
+-				}
++				finalizeFrame();
+ 				s_slideFlush   = false;
+ 				s_slideCapture = false;
+ 				s_slideSample  = 0;
+@@ -3755,12 +3765,7 @@ namespace render
+ 				// written, so the file is final. Hand it over BEFORE advancing -
+ 				// buildPath keys off s_frame, and the last frame has to go out
+ 				// before the finish() below returns.
+-				if (videoout::active())
+-				{
+-					char done[MAX_PATH];
+-					buildPath(done, sizeof(done));
+-					videoout::pushFrame(done);
+-				}
++				finalizeFrame();
+ 
+ 				// The lens, per frame, as the add-on actually received it.
+ 				//
+diff --git a/src/main.cpp b/src/main.cpp
+index 16ab9b0..c776a2c 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -8,6 +8,7 @@
+ #include "main.h"
+ #include "capture/fxcapture.h"
+ #include "capture/render.h"
++#include "capture/overlay.h"
+ #include "capture/exporthook.h"
+ #include "lights/lights.h"
+ 
+@@ -24,6 +25,7 @@ static void InstallResolved()
+ 	// create a file that the first real bind immediately replaces.
+ 
+ 	fxcapture::init();
++	overlay::publishFolder();
+ 	render::applyConfig();
+ 	render::installHooks();
+ 	smoothblend::install();
