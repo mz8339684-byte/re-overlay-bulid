@@ -36,7 +36,7 @@ jobs:
 
       - name: Build RockstarEditorPlus.asi
         run: |
-          cmake -S REPlus -B REPlus/build.vs -A x64
+          cmake -S REPlus -B REPlus/build.vs -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build REPlus/build.vs --config Release
 
       - name: Set up MSBuild
