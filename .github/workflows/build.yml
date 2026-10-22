@@ -45,7 +45,7 @@ jobs:
 
       - name: Build RockstarEditorPlus.asi
         run: |
-          cmake -S REPlus -B REPlus/build.vs -A x64
+          cmake -S REPlus -B REPlus/build.vs -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
           cmake --build REPlus/build.vs --config Release
 
       - name: Set up MSBuild
@@ -55,7 +55,14 @@ jobs:
         shell: pwsh
         run: |
           $sd = ((Resolve-Path "simplecamera/external/IgcsConnector-main/src").Path -replace '\\','/') + "/"
-          msbuild simplecamera/external/IgcsConnector-main/src/IgcsConnector.vcxproj /p:Configuration=Release /p:Platform=x64 /m "/p:SolutionDir=$sd"
+          # The runner's Visual Studio is newer than the project file expects, so
+          # try its toolset first and fall back to the project's own (v143).
+          foreach ($ts in @('v145', 'v144', 'v143')) {
+            Write-Host "Trying toolset $ts"
+            msbuild simplecamera/external/IgcsConnector-main/src/IgcsConnector.vcxproj /p:Configuration=Release /p:Platform=x64 /m "/p:SolutionDir=$sd" "/p:PlatformToolset=$ts"
+            if ($LASTEXITCODE -eq 0) { break }
+          }
+          if ($LASTEXITCODE -ne 0) { throw "add-on build failed with every toolset" }
 
       - name: Collect the two files
         shell: pwsh
