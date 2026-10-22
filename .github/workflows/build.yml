@@ -1,0 +1,65 @@
+name: Build RE+ with overlay
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Keep line endings as they are
+        run: git config --global core.autocrlf false
+
+      - name: Get the patches (this repo)
+        uses: actions/checkout@v4
+
+      - name: Get Rockstar Editor+ source
+        uses: actions/checkout@v4
+        with:
+          repository: crxhvrd/REPlus
+          ref: c6eba57160ca444817b149b3304ed1454e0ba2d9
+          path: REPlus
+
+      - name: Get add-on source
+        uses: actions/checkout@v4
+        with:
+          repository: crxhvrd/simplecamera
+          ref: 13c92ef2565403ffcc2501f779ca7cd935e5d598
+          path: simplecamera
+
+      - name: Apply the overlay patches
+        shell: bash
+        run: |
+          git -C REPlus apply --ignore-whitespace --whitespace=nowarn ../patches/replus.patch
+          git -C simplecamera apply --ignore-whitespace --whitespace=nowarn ../patches/addon.patch
+
+      - name: Build RockstarEditorPlus.asi
+        run: |
+          cmake -S REPlus -B REPlus/build.vs -A x64
+          cmake --build REPlus/build.vs --config Release
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build IgcsConnector.addon64
+        shell: pwsh
+        run: |
+          $sd = ((Resolve-Path "simplecamera/external/IgcsConnector-main/src").Path -replace '\\','/') + "/"
+          msbuild simplecamera/external/IgcsConnector-main/src/IgcsConnector.vcxproj /p:Configuration=Release /p:Platform=x64 /m "/p:SolutionDir=$sd"
+
+      - name: Collect the two files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          Copy-Item REPlus/build.vs/BIN/Release/RockstarEditorPlus.asi out/
+          $addon = Get-ChildItem -Recurse simplecamera -Filter *.addon64 | Select-Object -First 1
+          if (-not $addon) { throw "add-on was not built" }
+          Copy-Item $addon.FullName out/IgcsConnector.addon64
+          Get-ChildItem out
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: RE-Plus-with-overlay
+          path: out/
